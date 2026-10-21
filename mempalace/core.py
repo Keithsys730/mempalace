@@ -6,6 +6,7 @@ import time
 import copy
 import uuid
 import tempfile
+from contextlib import contextmanager
 from pathlib import Path
 import filelock
 from typing import Dict, List, Optional, Any
@@ -44,6 +45,11 @@ class EventSemanticError(MemPalaceError):
 
 class RuleConflictError(MemPalaceError):
     """Raised when attempting to overwrite an immutable Layer 1 rule."""
+    pass
+
+
+class LockTimeoutError(MemPalaceError):
+    """Raised when acquiring filelock exceeds timeout."""
     pass
 
 
@@ -241,12 +247,18 @@ def replay_events(
 class MemoryPalace:
     """Manages 3-Layer Hierarchical Memory with Deterministic Event Replay."""
 
-    def __init__(self, store_dir: str = "data/memory_store", snapshot_interval: Optional[int] = 100):
+    def __init__(
+        self,
+        store_dir: str = "data/memory_store",
+        snapshot_interval: Optional[int] = 100,
+        repair_truncated_tail: bool = False
+    ):
         if snapshot_interval is not None and snapshot_interval <= 0:
             raise ValueError("snapshot_interval must be a positive integer or None")
 
         self.store_dir = store_dir
         self.snapshot_interval = snapshot_interval
+        self.repair_truncated_tail = repair_truncated_tail
         os.makedirs(self.store_dir, exist_ok=True)
         os.makedirs(self.snapshots_dir, exist_ok=True)
 
@@ -258,8 +270,16 @@ class MemoryPalace:
         self.events: List[DecisionEvent] = []
         self.state: DecisionStackState = DecisionStackState()
 
-        with self._lock:
+        with self._acquire_lock():
             self.load_all()
+
+    @contextmanager
+    def _acquire_lock(self):
+        try:
+            with self._lock:
+                yield
+        except filelock.Timeout as err:
+            raise LockTimeoutError(f"Timeout waiting to acquire filelock on {self.lock_file}: {err}") from err
 
     @property
     def snapshots_dir(self) -> str:
@@ -339,7 +359,7 @@ class MemoryPalace:
         self._load_topology()
 
         # 3. Load Layer 3: Deterministic Event Stream & Snapshots
-        self.events = self._read_event_log()
+        self.events = self._read_event_log(repair_truncated_tail=self.repair_truncated_tail)
 
         if self.events:
             # Check for latest valid snapshot for fast-forward replay
@@ -377,28 +397,49 @@ class MemoryPalace:
                 if seq is not None and seq <= max_seq and seq <= len(self.events):
                     matching_event = self.events[seq - 1]
                     if matching_event.seq_id == seq and matching_event.event_hash == tip_hash:
-                        loaded_state = DecisionStackState(**sdata["state"])
-                        return loaded_state, seq
+                        state_dict = sdata.get("state")
+                        if state_dict:
+                            # Verify snapshot state matches deterministic replay up to seq
+                            verified_state = replay_events(self.events[:seq], to_seq=seq, verify_hash=True)
+                            if state_dict != verified_state.model_dump():
+                                raise HashIntegrityError(
+                                    f"Snapshot tampering detected in {sfile} at seq {seq}: "
+                                    f"state payload diverges from deterministic replay"
+                                )
+                            loaded_state = DecisionStackState(**state_dict)
+                            return loaded_state, seq
+            except HashIntegrityError:
+                raise
             except Exception:
                 continue
 
         return None, 0
 
-    def _read_event_log(self) -> List[DecisionEvent]:
-        """Read all decision events from the append-only JSONL log."""
+    def _read_event_log(self, repair_truncated_tail: bool = False) -> List[DecisionEvent]:
+        """Read all decision events from the append-only JSONL log with optional fail-closed tail repair."""
         if not os.path.exists(self.events_file):
             return []
         events = []
         with open(self.events_file, "r", encoding="utf-8") as f:
-            for line_idx, line in enumerate(f, 1):
-                line = line.strip()
-                if not line:
-                    continue
-                try:
-                    data = json.loads(line)
-                    events.append(DecisionEvent(**data))
-                except Exception as e:
-                    raise MemPalaceError(f"Failed to parse event line {line_idx} in {self.events_file}: {line}") from e
+            lines = f.readlines()
+        total_lines = len(lines)
+        for line_idx, raw_line in enumerate(lines, 1):
+            line = raw_line.strip()
+            if not line:
+                continue
+            try:
+                data = json.loads(line)
+                events.append(DecisionEvent(**data))
+            except Exception as e:
+                is_tail = all(not l.strip() for l in lines[line_idx:])
+                if is_tail and repair_truncated_tail:
+                    # Truncate partial tail line cleanly under lock
+                    with open(self.events_file, "w", encoding="utf-8") as fw:
+                        fw.writelines(lines[:line_idx - 1])
+                        fw.flush()
+                        os.fsync(fw.fileno())
+                    break
+                raise MemPalaceError(f"Failed to parse event line {line_idx} in {self.events_file}: {line}") from e
         return events
 
     def _append_event_to_file(self, event: DecisionEvent):
@@ -416,8 +457,8 @@ class MemoryPalace:
         wall_time: Optional[float] = None
     ) -> DecisionEvent:
         """Hold cross-process lock, re-read on-disk tip, construct, append durably, and update state."""
-        with self._lock:
-            disk_events = self._read_event_log()
+        with self._acquire_lock():
+            disk_events = self._read_event_log(repair_truncated_tail=self.repair_truncated_tail)
             current_state = replay_events(disk_events, verify_hash=True) if disk_events else DecisionStackState()
 
             seq_id = current_state.current_seq + 1
@@ -485,7 +526,7 @@ class MemoryPalace:
 
     def save_all(self):
         """Save Layer 1 and Layer 2 rules/topology atomically under lock."""
-        with self._lock:
+        with self._acquire_lock():
             _atomic_write_json(
                 self._file_path("immutable_rules"),
                 {k: v.model_dump() for k, v in self._immutable_rules.items()}
@@ -505,7 +546,7 @@ class MemoryPalace:
         description: str,
         enforcement_type: str = "fail-closed"
     ) -> ImmutableRule:
-        with self._lock:
+        with self._acquire_lock():
             self._load_immutable_rules()
             if rule_id in self._immutable_rules:
                 raise RuleConflictError(
@@ -534,7 +575,7 @@ class MemoryPalace:
         key_apis: List[str] = None,
         verification_cmd: str = None
     ) -> TopologyNode:
-        with self._lock:
+        with self._acquire_lock():
             self._load_topology()
             node = TopologyNode(
                 name=name,
@@ -589,7 +630,7 @@ class MemoryPalace:
 
     def pop_decision(self, reason: str = "Popped decision", actor: str = "orchestrator") -> Optional[DecisionFrame]:
         """Pop the top decision frame by emitting a DECISION_POPPED event through serialized commit path."""
-        with self._lock:
+        with self._acquire_lock():
             disk_events = self._read_event_log()
             current_state = replay_events(disk_events, verify_hash=True) if disk_events else DecisionStackState()
 
@@ -664,13 +705,13 @@ class MemoryPalace:
 
     def replay(self, to_seq: Optional[int] = None) -> DecisionStackState:
         """Time-travel query: replay events up to to_seq without mutating active state."""
-        with self._lock:
+        with self._acquire_lock():
             events = self._read_event_log()
             return replay_events(events, to_seq=to_seq, verify_hash=True)
 
     def verify_chain_integrity(self) -> Dict[str, Any]:
         """Verify sequence monotonicity and SHA-256 hash chaining from disk genesis to tip."""
-        with self._lock:
+        with self._acquire_lock():
             disk_events = self._read_event_log()
             if not disk_events:
                 return {"ok": True, "total_events": 0, "tip_seq": 0, "tip_hash": "0" * 64}
@@ -680,10 +721,9 @@ class MemoryPalace:
                 temp_state = apply_event(temp_state, event, verify_hash=True)
 
             # Assert in-memory state is synchronized with verified on-disk state
-            if self.state.latest_hash != temp_state.latest_hash or self.state.current_seq != temp_state.current_seq:
+            if self.state.model_dump() != temp_state.model_dump():
                 raise HashIntegrityError(
-                    f"In-memory state (seq={self.state.current_seq}, hash='{self.state.latest_hash}') "
-                    f"differs from on-disk verified state (seq={temp_state.current_seq}, hash='{temp_state.latest_hash}')"
+                    f"In-memory state diverged from on-disk verified state at seq {temp_state.current_seq}"
                 )
 
             return {
@@ -721,9 +761,14 @@ class MemoryPalace:
         path = path.strip("/\\").replace("\\", "/")
         return f"palace://{path}" if path else "palace://"
 
-    def get_tiered_context(self, level: ContextLevel = ContextLevel.L1, max_decision_frames: int = 3) -> Dict[str, Any]:
+    def get_tiered_context(
+        self,
+        level: ContextLevel = ContextLevel.L1,
+        max_decision_frames: int = 3,
+        max_dead_ends: int = 5
+    ) -> Dict[str, Any]:
         """Generate tiered context package for agent handoff at specified level (L0, L1, L2)."""
-        with self._lock:
+        with self._acquire_lock():
             if level == ContextLevel.L0:
                 tip = self.state.active_stack[-1].to_tiered(ContextLevel.L0) if self.state.active_stack else "None"
                 return {
@@ -758,7 +803,9 @@ class MemoryPalace:
                         f.to_tiered(ContextLevel.L1)
                         for f in self.state.active_stack[-max_decision_frames:]
                     ],
-                    "dead_ends_pool": copy.deepcopy(self.state.dead_ends_pool),
+                    "dead_ends_pool": copy.deepcopy(
+                        self.state.dead_ends_pool[-max_dead_ends:] if max_dead_ends else self.state.dead_ends_pool
+                    ),
                     "event_lineage": {
                         "total_events": len(self.events),
                         "current_seq": self.state.current_seq,
@@ -783,7 +830,7 @@ class MemoryPalace:
 
     def get_active_context_package(self, max_decision_frames: int = 3) -> Dict[str, Any]:
         """Generate a concise, high-density, deep-copied context package for agent handoff (backward compatible)."""
-        with self._lock:
+        with self._acquire_lock():
             return {
                 "immutable_rules": [
                     f"[{r.rule_id}] ({r.category}) {r.description}"
@@ -818,7 +865,7 @@ class MemoryPalace:
         path = norm[9:]  # strip 'palace://'
         segments = [seg for seg in path.split("/") if seg] if path else []
 
-        with self._lock:
+        with self._acquire_lock():
             if not segments:
                 return self.get_tiered_context(level=level)
 
@@ -954,7 +1001,7 @@ class MemoryPalace:
         path = norm[9:]
         segments = [seg for seg in path.split("/") if seg] if path else []
 
-        with self._lock:
+        with self._acquire_lock():
             if not segments:
                 sup_file = os.path.join(self.store_dir, "heartbeats.json")
                 tasks_count = 0
@@ -1151,7 +1198,7 @@ class MemoryPalace:
                 tasks_count = 0
 
         lines = [f"{norm}"]
-        with self._lock:
+        with self._acquire_lock():
             # Layer 1: rules
             rule_count = len(self._immutable_rules)
             lines.append(f"├── rules/ ({rule_count} rules)")
@@ -1198,7 +1245,7 @@ class MemoryPalace:
         q = query.strip().lower()
         matches: List[Dict[str, Any]] = []
 
-        with self._lock:
+        with self._acquire_lock():
             # 1. Search Rules
             for r in self._immutable_rules.values():
                 if (

@@ -3,10 +3,11 @@
 import os
 import time
 import json
+from contextlib import contextmanager
 import filelock
 from typing import Dict, List, Optional, Any
 from .models import ProcessHeartbeat, TaskStatus
-from .core import _atomic_write_json
+from .core import _atomic_write_json, LockTimeoutError
 
 
 class ProcessSupervisor:
@@ -22,11 +23,22 @@ class ProcessSupervisor:
             self.lock_file = os.path.join(self.store_dir, ".supervisor.lock")
             self._lock = filelock.FileLock(self.lock_file, timeout=10.0)
             self.registry_file = os.path.join(self.store_dir, "heartbeats.json")
-            with self._lock:
+            with self._acquire_lock():
                 self._load_registry()
         else:
             self._lock = None
             self.registry_file = None
+
+    @contextmanager
+    def _acquire_lock(self):
+        if not self._lock:
+            yield
+            return
+        try:
+            with self._lock:
+                yield
+        except filelock.Timeout as err:
+            raise LockTimeoutError(f"Timeout waiting to acquire supervisor lock on {self.lock_file}: {err}") from err
 
     def _load_registry(self):
         if self.registry_file and os.path.exists(self.registry_file):
@@ -55,7 +67,7 @@ class ProcessSupervisor:
         process_pid = pid or os.getpid()
 
         if self._lock:
-            with self._lock:
+            with self._acquire_lock():
                 self._load_registry()
                 hb = ProcessHeartbeat(
                     task_id=task_id,
@@ -85,35 +97,60 @@ class ProcessSupervisor:
         task_id: str,
         log_snippet: str = "",
         status: TaskStatus = TaskStatus.RUNNING,
-        progress_epoch: Optional[int] = None
+        progress_epoch: Optional[int] = None,
+        allow_stalled_revive: bool = True
     ):
         status_enum = TaskStatus(status) if isinstance(status, str) else status
         if self._lock:
-            with self._lock:
+            with self._acquire_lock():
                 self._load_registry()
                 if task_id in self.tasks:
                     hb = self.tasks[task_id]
+                    current_status = hb.status if isinstance(hb.status, TaskStatus) else TaskStatus(hb.status)
+                    if current_status in (TaskStatus.COMPLETED, TaskStatus.FAILED):
+                        if status_enum == TaskStatus.RUNNING:
+                            raise ValueError(
+                                f"Cannot revive task '{task_id}' from terminal status '{current_status.value}' without explicit re-registration."
+                            )
+                    if current_status == TaskStatus.STALLED and status_enum == TaskStatus.RUNNING and not allow_stalled_revive:
+                        raise ValueError(
+                            f"Cannot revive stalled task '{task_id}' without explicit allow_stalled_revive gate."
+                        )
                     hb.last_heartbeat = time.time()
                     if log_snippet:
                         hb.last_log_snippet = log_snippet[-300:]
                     hb.status = status_enum
                     if progress_epoch is not None:
+                        if progress_epoch < hb.progress_epoch:
+                            raise ValueError(f"Progress epoch regression: {progress_epoch} < {hb.progress_epoch}")
                         hb.progress_epoch = progress_epoch
                     self._save_registry()
         else:
             if task_id in self.tasks:
                 hb = self.tasks[task_id]
+                current_status = hb.status if isinstance(hb.status, TaskStatus) else TaskStatus(hb.status)
+                if current_status in (TaskStatus.COMPLETED, TaskStatus.FAILED):
+                    if status_enum == TaskStatus.RUNNING:
+                        raise ValueError(
+                            f"Cannot revive task '{task_id}' from terminal status '{current_status.value}' without explicit re-registration."
+                        )
+                if current_status == TaskStatus.STALLED and status_enum == TaskStatus.RUNNING and not allow_stalled_revive:
+                    raise ValueError(
+                        f"Cannot revive stalled task '{task_id}' without explicit allow_stalled_revive gate."
+                    )
                 hb.last_heartbeat = time.time()
                 if log_snippet:
                     hb.last_log_snippet = log_snippet[-300:]
                 hb.status = status_enum
                 if progress_epoch is not None:
+                    if progress_epoch < hb.progress_epoch:
+                        raise ValueError(f"Progress epoch regression: {progress_epoch} < {hb.progress_epoch}")
                     hb.progress_epoch = progress_epoch
 
     def check_health(self) -> Dict[str, Any]:
         """Inspect all tasks and exhaustively classify status without state bleed."""
         if self._lock:
-            with self._lock:
+            with self._acquire_lock():
                 self._load_registry()
                 res = self._evaluate_health()
                 self._save_registry()

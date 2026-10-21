@@ -95,6 +95,9 @@ def main():
     # verify-integrity
     subparsers.add_parser("verify-integrity", help="Verify SHA-256 hash chain and sequence monotonicity from genesis to tip")
 
+    # repair
+    subparsers.add_parser("repair", help="Repair and salvage event log by truncating corrupted/incomplete EOF line")
+
     # supervisor register-task
     reg_p = subparsers.add_parser("register-task", help="Register a background task with the supervisor")
     reg_p.add_argument("--task-id", required=True, help="Unique task identifier")
@@ -115,7 +118,21 @@ def main():
     args = parser.parse_args()
 
     resolved_store = get_default_store_dir(args.store)
-    palace = MemoryPalace(store_dir=resolved_store)
+    if args.command == "repair":
+        palace = MemoryPalace(store_dir=resolved_store, repair_truncated_tail=True)
+        print("✅ MemPalace 事件日誌已檢驗並完成修復！")
+        print(f"🔢 當前有效事件數: {len(palace.events)} (Seq #{palace.state.current_seq})")
+        return
+
+    try:
+        palace = MemoryPalace(store_dir=resolved_store)
+    except (HashIntegrityError, EventSequenceError, MemPalaceError) as init_err:
+        if args.command == "verify-integrity":
+            print(f"🔍 正在驗證 MemPalace 全量事件鏈完整性與防篡改簽名...")
+            print(f"❌ 完整性校驗失敗 (CORRUPTED / TAMPERED): {init_err}")
+            sys.exit(1)
+        raise
+
     supervisor = ProcessSupervisor(store_dir=resolved_store)
 
     if args.command == "bootstrap":
